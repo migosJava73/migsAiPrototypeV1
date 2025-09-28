@@ -1,7 +1,10 @@
 flask==3.0.3
 supabase==2.9.0
-pymupdf==1.26.4  # PDF/OCR core
-tenacity==9.0.0  # Retries
-gunicorn==23.0.0  # Prod server
-uvicorn==0.31.1  # Async workers
+pymupdf==1.26.4
+tenacity==9.0.0
+gunicorn==23.0.0
+uvicorn==0.31.1
+pytesseract==0.3.10
+pillow==10.4.0  # For PIL/Image
+requests==2.32.3  # For PDF download
 # Note: GCP container adds Tesseract via Dockerfile—no Python dep needed. For local dev: pip install -r this. Prod: GCP builds auto.
