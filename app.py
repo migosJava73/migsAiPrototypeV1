@@ -1,118 +1,219 @@
+from flask import Flask, request, jsonify
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+import io
 import os
-import fitz
+import requests
 from supabase import create_client, Client
-from datetime import datetime, timezone
-from flask import Flask, request, jsonify, make_response
-from tenacity import retry, stop_after_attempt, wait_fixed
+from datetime import datetime
+import logging
+import json
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SERVICE_ROLE_KEY = os.getenv("SERVICE_ROLE_KEY")
-print(f"Env check: SUPABASE_URL set? {bool(SUPABASE_URL)}, SERVICE_ROLE_KEY set? {bool(SERVICE_ROLE_KEY)}")
-if not all([SUPABASE_URL, SERVICE_ROLE_KEY]):
-    raise ValueError("Missing Supabase env vars—check settings.")
-
-supabase: Client = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
-
-os.environ['PATH'] += os.pathsep + '/usr/bin'
-os.environ['TESSDATA_PREFIX'] = '/usr/share/tesseract-ocr/5/tessdata'
-
-@retry(stop=stop_after_attempt(2), wait=wait_fixed(1))
-def extract_raw_text(pdf_bytes, contract_name, num_pages):
-    raw_text = ""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        text = page.get_text("text")
-        if len(text.strip()) < 50:
-            try:
-                textpage = page.get_textpage_ocr(language="eng", dpi=200)
-                text = page.get_text("text", textpage=textpage)
-            except Exception as ocr_err:
-                print(f"OCR failed: {ocr_err}")
-                raise
-        raw_text += f"{text}\n\n"
-    doc.close()
-
-    raw_text = raw_text.replace('\n{3,}', '\n\n').replace(r'\s{2,}', ' ').strip()
-
-    doc_type = "Vehicle Rental Agreement" if "rental" in contract_name.lower() else "Insurance Policy" if "insurance" in contract_name.lower() else "Document"
-    return f"DOCUMENT: {contract_name}\nDOCUMENT TYPE: {doc_type}\nPAGES: {num_pages}\nPROCESSED: {datetime.now(timezone.utc).isoformat()}\n\nCONTENT:\n{raw_text}\n\n---\nEND OF DOCUMENT"
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-@app.route('/', methods=['POST', 'OPTIONS'])
-def process_pdf():
-    print("=== Extraction triggered ===")
+# Supabase configuration (match Cloud Run secret names)
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
 
-    if request.method == 'OPTIONS':
-        response = make_response("ok")
-        response.headers.update({
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST",
-            "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type"
-        })
-        return response
+# Debug env vars and fail fast if missing
+logger.info("=== Flask app starting ===")
+logger.info(f"Env: SUPABASE_URL={SUPABASE_URL[:20] if SUPABASE_URL else None}..., SERVICE_ROLE_KEY={SUPABASE_SERVICE_ROLE_KEY[:10] if SUPABASE_SERVICE_ROLE_KEY else None}...")
+if not all([SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY]):
+    logger.error("Missing Supabase environment variables: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
 
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+logger.info("Supabase client initialized")
+
+# Tesseract env setup
+os.environ['PATH'] += os.pathsep + '/usr/bin'
+os.environ['TESSDATA_PREFIX'] = '/usr/share/tesseract-ocr/5/tessdata'
+logger.info("Tesseract env set")
+
+def extract_text_from_pdf(pdf_url):
+    """Extract text from PDF with OCR fallback for scanned pages"""
     try:
-        body = request.json
-        print(f"Payload: {body}")
+        logger.info(f"Downloading PDF from: {pdf_url}")
+        response = requests.get(pdf_url)
+        response.raise_for_status()
+        
+        pdf_bytes = response.content
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = ""
+        
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            page_text = page.get_text()
+            
+            if len(page_text.strip()) < 50:  # Likely scanned page
+                logger.info(f"Page {page_num + 1} appears to be scanned, using OCR")
+                pix = page.get_pixmap()
+                img_data = pix.tobytes("png")
+                img = Image.open(io.BytesIO(img_data))
+                ocr_text = pytesseract.image_to_string(img)
+                text += f"\n--- Page {page_num + 1} (OCR) ---\n{ocr_text}"
+            else:
+                text += f"\n--- Page {page_num + 1} ---\n{page_text}"
+        
+        doc.close()
+        logger.info(f"Extracted {len(text)} characters from PDF")
+        return text
+        
     except Exception as e:
-        print(f"Parse error: {e}")
-        return jsonify({'success': False, 'error': 'Invalid JSON', 'timestamp': datetime.now(timezone.utc).isoformat()}), 400
+        logger.error(f"Error extracting text from PDF: {str(e)}")
+        raise
 
-    if body.get('test') == 'ping':
-        return jsonify({'success': True, 'message': 'Pong! GCP ready'}), 200
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    logger.info("Health check called")
+    return jsonify({"status": "healthy"}), 200
 
-    contract_id = body.get('contract_id')
-    if not contract_id:
-        return jsonify({'success': False, 'error': 'Missing contract_id', 'timestamp': datetime.now(timezone.utc).isoformat()}), 400
-
+@app.route('/', methods=['GET', 'POST'])
+def process_contract():
+    """Main endpoint for processing contracts"""
+    if request.method == 'GET':
+        logger.info("Ping received")
+        return jsonify({"success": True, "message": "Pong! GCP ready"}), 200
+    
     try:
-        # Updated query handling for supabase-py 2.9.0
-        response = supabase.table("contracts").select("storage_path, contract_name, file_name").eq("id", contract_id).execute()
-        print(f"Supabase response: data={response.data}, count={response.count}")
-        if not response.data:
-            raise ValueError(f"No contract found for ID: {contract_id}")
-
-        contract = response.data[0]
-        file_path = contract['storage_path'].split("/storage/v1/object/public/contracts/")[1] if "/storage/v1/object/public/contracts/" in contract['storage_path'] else None
-        if not file_path:
-            raise ValueError("Invalid storage path")
-
-        print(f"Downloading: {file_path}")
-        download_response = supabase.storage.from_("contracts").download(file_path)
-        if not download_response:
-            raise ValueError("Download failed")
-
-        num_pages = len(fitz.open(stream=download_response, filetype="pdf"))
-        extracted_text = extract_raw_text(download_response, contract['contract_name'], num_pages)
-        if not extracted_text:
-            raise ValueError("Extraction failed")
-
-        print(f"Extracted text length: {len(extracted_text)}")
-        update_data = {"raw_text": extracted_text, "upload_status": "completed", "processed_at": datetime.now(timezone.utc).isoformat()}
-        update_response = supabase.table("contracts").update(update_data).eq("id", contract_id).execute()
-        if not update_response.data:
-            raise ValueError("Update failed—check Supabase logs")
-
-        print("Extraction successful!")
+        # Get ALL webhook data for debugging
+        webhook_data = {}
+        
+        # Check JSON body
+        if request.is_json:
+            webhook_data['json_body'] = request.get_json()
+        
+        # Check form data
+        if request.form:
+            webhook_data['form_data'] = request.form.to_dict()
+        
+        # Check query parameters
+        if request.args:
+            webhook_data['query_params'] = request.args.to_dict()
+        
+        # Check headers (for debugging)
+        webhook_data['headers'] = dict(request.headers)
+        
+        # Log everything for debugging
+        logger.info(f"=== WEBHOOK DEBUG INFO ===")
+        logger.info(f"Content-Type: {request.content_type}")
+        logger.info(f"Method: {request.method}")
+        logger.info(f"Raw data: {request.get_data()}")
+        logger.info(f"Webhook data: {json.dumps(webhook_data, indent=2)}")
+        logger.info(f"========================")
+        
+        # Try to extract contract_id and upload_status from various sources
+        contract_id = None
+        upload_status = None
+        
+        # Priority 1: JSON body
+        if webhook_data.get('json_body'):
+            contract_id = webhook_data['json_body'].get('contract_id')
+            upload_status = webhook_data['json_body'].get('upload_status')
+        
+        # Priority 2: Form data
+        if not contract_id and webhook_data.get('form_data'):
+            contract_id = webhook_data['form_data'].get('contract_id')
+            upload_status = webhook_data['form_data'].get('upload_status')
+        
+        # Priority 3: Query parameters
+        if not contract_id and webhook_data.get('query_params'):
+            contract_id = webhook_data['query_params'].get('contract_id')
+            upload_status = webhook_data['query_params'].get('upload_status')
+        
+        logger.info(f"Extracted - contract_id: {contract_id}, upload_status: {upload_status}")
+        
+        if not contract_id:
+            logger.error("No contract_id found in any data source")
+            return jsonify({
+                "success": False, 
+                "error": "contract_id is required",
+                "debug_info": webhook_data
+            }), 400
+        
+        # Check if upload_status is "processing" (if provided by webhook)
+        if upload_status and upload_status != "processing":
+            logger.info(f"Webhook upload_status is '{upload_status}' - skipping processing")
+            return jsonify({
+                "success": True, 
+                "message": f"Skipped - webhook status is {upload_status}",
+                "debug_info": webhook_data
+            }), 200
+        
+        # Fetch contract details from Supabase to double-check
+        logger.info(f"Fetching contract details for ID: {contract_id}")
+        result = supabase.table('contracts').select('*').eq('id', contract_id).execute()
+        
+        if not result.data:
+            logger.error(f"Contract not found: {contract_id}")
+            return jsonify({
+                "success": False, 
+                "error": "Contract not found",
+                "contract_id": contract_id
+            }), 404
+        
+        contract = result.data[0]
+        storage_path = contract.get('storage_path')
+        db_upload_status = contract.get('upload_status')
+        
+        logger.info(f"Database upload_status: {db_upload_status}")
+        
+        # Double-check the status from database
+        if db_upload_status != 'processing':
+            logger.info(f"Database status is '{db_upload_status}' - skipping processing")
+            return jsonify({
+                "success": True, 
+                "message": f"Skipped - database status is {db_upload_status}",
+                "webhook_status": upload_status,
+                "database_status": db_upload_status
+            }), 200
+        
+        if not storage_path:
+            logger.error(f"No storage_path for contract: {contract_id}")
+            return jsonify({
+                "success": False, 
+                "error": "No storage_path found",
+                "contract_id": contract_id
+            }), 400
+        
+        # Extract text from PDF
+        logger.info(f"Starting text extraction for contract: {contract_id}")
+        raw_text = extract_text_from_pdf(storage_path)
+        
+        # Update contract with extracted text
+        update_data = {
+            'raw_text': raw_text,
+            'upload_status': 'completed',
+            'processed_at': datetime.utcnow().isoformat()
+        }
+        
+        logger.info(f"Updating contract {contract_id} with extracted text")
+        supabase.table('contracts').update(update_data).eq('id', contract_id).execute()
+        
+        logger.info(f"Extraction successful for contract: {contract_id}")
         return jsonify({
-            'success': True,
-            'message': 'Processed',
-            'contract_id': contract_id,
-            'text_length': len(extracted_text),
-            'preview': extracted_text[:500] + '...'
+            "success": True, 
+            "message": "Extraction successful!",
+            "contract_id": contract_id,
+            "text_length": len(raw_text),
+            "webhook_status": upload_status,
+            "database_status": db_upload_status
         }), 200
-
-    except Exception as error:
-        print(f"Error: {error}")
-        if contract_id:
-            supabase.table("contracts").update({
-                "upload_status": "failed",
-                "raw_text": f"Failed: {str(error)}.",
-                "processed_at": datetime.now(timezone.utc).isoformat()
-            }).eq("id", contract_id).execute()
-        return jsonify({'success': False, 'error': str(error), 'timestamp': datetime.now(timezone.utc).isoformat()}), 500
+        
+    except Exception as e:
+        logger.error(f"Error processing contract: {str(e)}")
+        return jsonify({
+            "success": False, 
+            "error": str(e),
+            "debug_info": webhook_data if 'webhook_data' in locals() else None
+        }), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
